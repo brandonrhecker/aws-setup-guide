@@ -283,6 +283,16 @@ Once Phase 0 is complete, you have a working AWS account + local CDK environment
 
 ---
 
+## Per-service guides
+
+Once Phase 0 is done, see [`services/`](./services/) for per-service walkthroughs (console + CLI commands, security defaults, pricing notes, common gotchas):
+
+- [**S3**](./services/s3.md) — object storage; bucket creation, file upload, security, pricing
+
+(More added as I touch each service.)
+
+---
+
 ## References
 
 - AWS CLI install: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
