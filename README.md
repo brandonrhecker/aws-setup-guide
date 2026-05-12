@@ -276,10 +276,44 @@ Once Phase 0 is complete, you have a working AWS account + local CDK environment
 2. **Phase 2:** First Lambda + API Gateway endpoint
 3. **Phase 3:** DynamoDB tables
 4. **Phase 4:** Wire all API routes through Lambda
-5. **Phase 5:** Auth (Cloudflare Access or Cognito)
-6. **Phase 6:** Domain + HTTPS (Route 53 + ACM)
-7. **Phase 7:** CI/CD via GitHub Actions + OIDC (no static AWS keys in repo)
-8. **Phase 8:** CloudWatch dashboards + alarms
+5. **Phase 5:** Bedrock chat (Claude via AWS-native API)
+6. **Phase 6:** Auth (Cloudflare Access or Cognito)
+7. **Phase 7:** Domain + HTTPS (Route 53 + ACM)
+8. **Phase 8:** CI/CD via GitHub Actions + OIDC (no static AWS keys in repo)
+9. **Phase 9:** CloudWatch dashboards + alarms
+
+### Architecture you end up with (after Phase 4)
+
+```
+                    ┌─────────────────────────┐
+   Browser ─────►   │      CloudFront         │
+                    └────────┬────────────────┘
+                             │ behaviors:
+                  ┌──────────┴────────────┐
+                  │                       │
+            /api/*│                  /*   │ (everything else)
+                  ▼                       ▼
+        ┌──────────────────┐     ┌────────────────────┐
+        │   API Gateway    │     │   S3 (private)     │
+        │   ANY /api/      │     │  + 403 → SPA shell │
+        │   {proxy+}       │     │  (deep links)      │
+        └────────┬─────────┘     └────────────────────┘
+                 │
+                 ▼
+        ┌──────────────────┐
+        │   Lambda         │     <- One fat Lambda
+        │   (Python)       │        Internal regex
+        │   Dispatcher     │        dispatch
+        └────────┬─────────┘
+                 │
+                 ▼
+        ┌──────────────────┐
+        │   DynamoDB       │     <- Pre-serialized JSON
+        │   on-demand      │        in `data` attribute
+        └──────────────────┘
+```
+
+Total resources: 1 distribution, 2 origins, 2 behaviors, 1 HTTP API, 1 Lambda function, 1 DynamoDB table. Cost at low traffic: ~$0/month.
 
 ---
 

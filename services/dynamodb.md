@@ -286,6 +286,48 @@ One partition is getting too many requests because your partition key has low ca
 
 ---
 
+## Pattern: pre-serialized blob in a `data` attribute
+
+When porting an existing app whose serialization logic is non-trivial (parses raw API responses → computes derived stats → returns JSON for the frontend), the simplest Lambda design is:
+
+1. **Run the serialization locally** (or in a separate "ingest" Lambda)
+2. **Store the serialized JSON as a single `data` string attribute** on the DDB item, alongside a few flat columns for list-view projection
+3. **The hot-path Lambda is a pass-through** — `get_item` → `json.loads(item["data"])` → return
+
+### Table shape
+```
+slug (PK)              "Bucee_Smashcan"
+name                   "Bucee Smashcan"          <- list view
+race                   "Mapach"                  <- list view
+classes                "Fighter 7"               <- list view (flat string!)
+side                   "light"                   <- list view
+data                   "{...big JSON blob...}"   <- detail view
+```
+
+### Why this is good
+
+- **Lambda stays tiny** — no need to package the parsing/serialization code in the Lambda zip
+- **Cold starts are fast** — boto3 + DDB read, no big dependencies loaded
+- **List view is cheap** — `ProjectionExpression` skips the big `data` attribute
+- **400 KB item limit is rarely a problem** — frontend-shape JSON is usually 20-50 KB; raw API blobs might exceed limit and should go to S3 instead
+
+### When to outgrow it
+
+- Output shape changes frequently → re-seeding gets annoying → move serialization into a Lambda triggered by ingest events
+- Raw blobs >400 KB → put the blob in S3, store the S3 key in DDB
+- Same data needs multiple shapes (mobile vs. web) → serialize on read, or store multiple shapes
+
+### Frontend compatibility gotcha
+
+The new backend can return *valid JSON* in *technically the wrong shape* — and you only find out from the frontend. Example: serializer returns `classes: [{name: "Fighter", level: 7}]`, but the legacy frontend expects `classes: "Fighter 7"` (flat string).
+
+**Mitigation:**
+- Compare the new endpoint's response to the legacy server's response field-by-field
+- The seeding script is the natural place to do the flattening — write tests that pin the exact response shape
+- Phase 8 (CI/CD) should run a smoke test that asserts both the keys *and the types* match
+
+---
+
 ## When DynamoDB is NOT the right answer
 
 | Need | Better choice |

@@ -115,6 +115,48 @@ body   = json.loads(event["body"] or "{}")
 
 ---
 
+## Pattern: catch-all proxy integration (`ANY /api/{proxy+}`)
+
+For small backends with many routes, instead of creating one API Gateway route per endpoint, create **one** route that catches everything under `/api/*` and sends it to a single Lambda. The Lambda dispatches internally.
+
+**Why:**
+- Most endpoint changes don't require touching API Gateway at all — just deploy the Lambda
+- The route table lives in Python alongside the handlers (greppable, testable)
+- Fewer moving parts during the prototype phase
+
+### Setup
+
+1. Routes tab → **Create**
+2. Method: **ANY** (matches GET/POST/PUT/DELETE/etc.)
+3. Resource path: **`/api/{proxy+}`** — the `+` means "match remaining path including slashes" (so `/api/foo/bar/baz` matches and `proxy = "foo/bar/baz"`)
+4. Attach the Lambda integration
+
+That's it. Any new endpoint inside `/api/*` is now a Python concern, not a console concern.
+
+### Lambda reads the path
+
+```python
+def lambda_handler(event, context):
+    method = event["requestContext"]["http"]["method"]
+    path   = event["rawPath"]   # "/api/characters/Bucee_Smashcan"
+    # dispatch on (method, path) here
+```
+
+You don't need to use `event["pathParameters"]["proxy"]` — `rawPath` is cleaner.
+
+### Tradeoff vs. explicit routes
+
+| | Catch-all proxy | Per-route |
+|---|---|---|
+| API Gateway clicks per new endpoint | 0 (just edit Lambda) | 4-5 (create route, attach integration, deploy) |
+| Routing logic visible in IaC | No (lives in Lambda code) | Yes (everything in CDK/Terraform) |
+| Per-route IAM authorizer | No (apply to the whole proxy or none) | Yes (per-route JWT/IAM) |
+| Best for | Prototypes, small apps, single team | Production w/ teams owning different routes |
+
+Move to per-route Lambdas + per-route API Gateway routes when you need finer-grained auth, separate CloudWatch logs, or independent deploys.
+
+---
+
 ## Path parameters
 
 Add a route like `GET /api/characters/{slug}` — `{slug}` is the variable. In Lambda:

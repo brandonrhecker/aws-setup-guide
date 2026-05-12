@@ -237,6 +237,95 @@ Default: Lambda runs in AWS-managed VPC with internet egress. To reach private R
 
 ---
 
+## Pattern: One Fat Lambda + Internal Dispatch
+
+For small/personal serverless backends, the simplest architecture is **one Lambda that handles every `/api/*` request**, with a single API Gateway route `ANY /api/{proxy+}` pointing at it. Internal dispatch (regex on `event["rawPath"]` + method) routes to per-endpoint handler functions.
+
+**Benefits:**
+- One CloudWatch log group to tail
+- One execution role to manage
+- Warm container shared across endpoints (fewer cold starts overall)
+- Adding a route = one entry in a table + one handler function
+
+**Costs:**
+- Whole API breaks if the module fails to import (syntax error, missing dep)
+- Larger zip if you have many endpoints with diverse deps
+- IAM scoping is per-function — granting DDB write to one route means *every* route can write
+
+For order-d20 at 10 users, this is the right shape. At >5 engineers and >50 endpoints, split into per-route Lambdas (or use AWS SAM/CDK to do that for you).
+
+### Template
+
+```python
+import json, os, re
+import boto3
+from boto3.dynamodb.types import TypeDeserializer
+
+DDB = boto3.client("dynamodb")
+DESER = TypeDeserializer().deserialize
+
+
+def _response(status, body):
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+        },
+        "body": json.dumps(body, default=str),
+    }
+
+
+def list_characters(event, context, params):
+    resp = DDB.scan(TableName="my-table")
+    return _response(200, [
+        {k: DESER(v) for k, v in item.items()}
+        for item in resp.get("Items", [])
+    ])
+
+
+def get_character(event, context, params):
+    slug = params["slug"]
+    resp = DDB.get_item(TableName="my-table", Key={"slug": {"S": slug}})
+    if "Item" not in resp:
+        return _response(404, {"error": f"not found: {slug}"})
+    return _response(200, {k: DESER(v) for k, v in resp["Item"].items()})
+
+
+# (METHOD, regex with named groups, handler)
+ROUTES = [
+    ("GET",  r"/api/characters",                 list_characters),
+    ("GET",  r"/api/characters/(?P<slug>[^/]+)", get_character),
+    # Add more routes here ↑
+]
+
+
+def dispatch(method, path):
+    for m, pattern, handler in ROUTES:
+        if m != method:
+            continue
+        match = re.fullmatch(pattern, path)
+        if match:
+            return handler, match.groupdict()
+    return None, None
+
+
+def lambda_handler(event, context):
+    method = event["requestContext"]["http"]["method"]
+    path = event["rawPath"]
+    handler, params = dispatch(method, path)
+    if handler is None:
+        return _response(404, {"error": f"no route for {method} {path}"})
+    try:
+        return handler(event, context, params)
+    except Exception as e:
+        return _response(500, {"error": str(e), "where": handler.__name__})
+```
+
+Pair this with API Gateway: a single `ANY /api/{proxy+}` route → this Lambda. Every request lands at `lambda_handler`, gets dispatched.
+
+---
+
 ## When Lambda is NOT the right answer
 
 | Scenario | Better choice |
