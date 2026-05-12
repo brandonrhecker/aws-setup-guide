@@ -92,6 +92,24 @@ That replaces the entire console wizard in ~10 lines.
 
 ---
 
+## Pattern: one distribution, multiple origins (static + API)
+
+A common architecture: serve the static frontend from S3 *and* the `/api/*` routes from API Gateway *through the same CloudFront domain*. Saves having to deal with CORS between frontend and API.
+
+**How to set it up:**
+1. Distribution already exists with S3 as default origin (Phase 1)
+2. Add API Gateway as a **second origin** (no OAC — API Gateway is public HTTPS)
+3. Add a **behavior** with path pattern `/api/*` → that new origin, with:
+   - Cache policy: **`CachingDisabled`** (don't cache API responses)
+   - Origin request policy: **`AllViewerExceptHostHeader`** (critical — see gotcha below)
+   - Allowed methods: GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE
+
+**Behavior precedence** matters — CloudFront matches behaviors top-down by path pattern. The wildcard `Default (*)` should always be last. New behaviors created via console default to precedence 0 (highest), which is what you want for `/api/*`.
+
+This pattern lets your frontend just call `fetch("/api/characters")` — same origin, no CORS headers needed.
+
+---
+
 ## OAC: how CloudFront reads a private S3 bucket
 
 **Old way (avoid):** Public S3 bucket. Bypasses CloudFront entirely if someone finds the S3 URL. Common data-leak vector.
@@ -254,6 +272,13 @@ You can't delete an Enabled distribution. Disable it first → wait for deployme
 
 **Logs cost real money**
 Standard logging delivers access logs to an S3 bucket — fine, but at scale you may want to disable it or move to real-time logs with sampling.
+
+**API Gateway origin returns 403 `ForbiddenException` when accessed via CloudFront, but works directly**
+The `AllViewer` managed origin-request policy forwards the viewer's `Host` header (your CloudFront domain) to API Gateway. API Gateway doesn't recognize that host and returns 403.
+
+**Fix:** Use the managed origin-request policy **`AllViewerExceptHostHeader`** for any behavior whose origin is API Gateway / ALB / Lambda Function URL. CloudFront then rewrites Host to the origin's hostname.
+
+Behavior → Edit → Origin request policy → **AllViewerExceptHostHeader** → Save. ~5 min redeploy.
 
 ---
 
