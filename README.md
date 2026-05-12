@@ -289,6 +289,8 @@ Once Phase 0 is done, see [`services/`](./services/) for per-service walkthrough
 
 - [**S3**](./services/s3.md) — object storage; bucket creation, file upload, security, pricing
 - [**CloudFront**](./services/cloudfront.md) — CDN; distribution setup, OAC, cache invalidation, default-root-object gotcha
+- [**Lambda**](./services/lambda.md) — functions-as-a-service; runtimes, handler shape, CLI vs console deploys, paste-indent gotcha
+- [**API Gateway**](./services/api-gateway.md) — HTTP API vs REST API decision, routes/integrations/stages, v2.0 event format
 
 (More added as I touch each service.)
 
