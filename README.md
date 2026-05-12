@@ -288,6 +288,7 @@ Once Phase 0 is complete, you have a working AWS account + local CDK environment
 Once Phase 0 is done, see [`services/`](./services/) for per-service walkthroughs (console + CLI commands, security defaults, pricing notes, common gotchas):
 
 - [**S3**](./services/s3.md) — object storage; bucket creation, file upload, security, pricing
+- [**CloudFront**](./services/cloudfront.md) — CDN; distribution setup, OAC, cache invalidation, default-root-object gotcha
 
 (More added as I touch each service.)
 
