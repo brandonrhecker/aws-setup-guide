@@ -110,6 +110,52 @@ This pattern lets your frontend just call `fetch("/api/characters")` — same or
 
 ---
 
+## Pattern: SPA deep links (rewrite 403/404 to your shell HTML)
+
+If you visit `https://your-cf.cloudfront.net/character/Bucee_Smashcan` and the frontend uses *client-side routing* (the URL `/character/<slug>` is interpreted by JS, not a real file in S3), you'll get an XML **`Access Denied`** error. S3 returned 403 because the file `/character/Bucee_Smashcan` doesn't exist in the bucket.
+
+**Fix:** add a CloudFront **custom error response** that maps 403 → your SPA shell HTML with a 200 status.
+
+### Console steps
+1. Distribution → **Error pages** tab → **Create custom error response**
+2. **HTTP error code:** **403: Forbidden**
+3. **Error caching minimum TTL:** `0` (don't cache the rewrite)
+4. **Customize error response:** **Yes**
+5. **Response page path:** `/index.html` (or `/character.html` if your deep links land on a separate shell)
+6. **HTTP response code:** **200: OK**
+7. **Create** — distribution redeploys in ~5 min
+
+### CLI (boto3)
+```python
+import boto3
+
+cf = boto3.client("cloudfront")
+resp = cf.get_distribution_config(Id="<dist-id>")
+config, etag = resp["DistributionConfig"], resp["ETag"]
+
+new_rule = {
+    "ErrorCode": 403,
+    "ResponsePagePath": "/index.html",
+    "ResponseCode": "200",
+    "ErrorCachingMinTTL": 0,
+}
+existing = config.get("CustomErrorResponses", {"Quantity": 0, "Items": []})
+items = [i for i in existing.get("Items", []) if i["ErrorCode"] != 403]
+items.append(new_rule)
+config["CustomErrorResponses"] = {"Quantity": len(items), "Items": items}
+
+cf.update_distribution(Id="<dist-id>", IfMatch=etag, DistributionConfig=config)
+```
+
+### Why this doesn't accidentally rewrite `/api/*` errors
+
+This is the elegant part: **S3 returns 403 for missing files; API Gateway returns 404 for missing routes.** Different status codes → the 403 rewrite only kicks in for S3 misses, never for failed API calls. If you ever do want to handle both, configure them separately.
+
+### Caveat
+A truly random URL (e.g. `/nonsense`) will also serve your SPA shell with 200. Most SPA routers handle that gracefully (redirect to home, show a "not found" component). Add JS to detect "no recognizable route → redirect to /" if you care.
+
+---
+
 ## OAC: how CloudFront reads a private S3 bucket
 
 **Old way (avoid):** Public S3 bucket. Bypasses CloudFront entirely if someone finds the S3 URL. Common data-leak vector.
