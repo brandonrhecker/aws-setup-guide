@@ -328,6 +328,123 @@ The new backend can return *valid JSON* in *technically the wrong shape* — and
 
 ---
 
+## Pattern: composite keys for multi-entity tables
+
+When an app has more than one entity type (characters, sessions, events), the right shape is rarely "one table per entity" *or* "everything in one table." It's usually:
+
+- **One table per top-level entity** (characters)
+- **One child table** per child entity that you query by parent (sessions, events)
+- **Composite key (PK + SK)** on the child tables so a single `Query` returns every child for a parent
+
+### Concrete example
+
+```
+characters    PK: slug                                  → one row per character
+sessions      PK: slug,         SK: session_id          → many rows per character
+events        PK: session_id,   SK: event_id            → many rows per session
+```
+
+Why this works:
+
+- **List all sessions for a character:** `Query` on `sessions` with PK = slug. Single call, one partition.
+- **List all events for a session:** `Query` on `events` with PK = session_id. Single call, one partition.
+- **Newest sessions first:** SK is a date-prefixed id (`S-2026-05-13-001`), so `ScanIndexForward=false` returns reverse-chronological order with no client-side sort.
+- **Event ordering:** SK is a time-sortable id (`<ms_hex>-<random_hex>`), so events come back chronological with no sort.
+
+### Why not "single-table design"?
+
+The full Rick Houlihan / "everything in one table" pattern is powerful for very-high-scale, well-understood access patterns. It's also brutal to read 6 months later. At <100 RPS and <10 access patterns, the multi-table layout above is plenty fast and a *lot* easier for a human to reason about.
+
+Single-table makes sense when:
+- You've hit the practical Scan/Query limit on per-table partitions
+- You need transactional writes across entities (DDB transactions can span up to 100 items but only within one table without extra plumbing)
+- You're moving to provisioned capacity and want to share it
+
+Until then, keep entities in separate tables and use composite keys to model parent → many-children.
+
+### Key Condition gotchas
+
+- `KeyConditionExpression` can use `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `begins_with` on the SK — and *only* `=` on the PK. You can't `begins_with` on a partition key.
+- `ScanIndexForward` is a boolean on the SK direction: `true` = ascending (default), `false` = descending. There's no equivalent for PK.
+- If you need to filter by an attribute that's not part of the key, use `FilterExpression` — but understand it filters *after* the read, so you still pay for the items that didn't match.
+
+---
+
+## Pattern: cascade delete (DDB has no foreign keys)
+
+DDB doesn't know that a session's events live in another table. When you delete a character, nothing automatic happens to their sessions or events — you have to do the cascade yourself.
+
+```python
+def delete_character(slug):
+    # 1. Find all sessions for this character.
+    sessions = sessions_table.query(KeyConditionExpression=Key("slug").eq(slug))
+    for s in sessions["Items"]:
+        # 2. For each session, delete its events with BatchWriteItem (25-item batches).
+        last_key = None
+        while True:
+            kwargs = {"KeyConditionExpression": Key("session_id").eq(s["session_id"])}
+            if last_key:
+                kwargs["ExclusiveStartKey"] = last_key
+            page = events_table.query(**kwargs)
+            if page["Items"]:
+                with events_table.batch_writer() as batch:
+                    for it in page["Items"]:
+                        batch.delete_item(Key={
+                            "session_id": it["session_id"],
+                            "event_id":   it["event_id"],
+                        })
+            last_key = page.get("LastEvaluatedKey")
+            if not last_key:
+                break
+        # 3. Delete the session row itself.
+        sessions_table.delete_item(Key={"slug": slug, "session_id": s["session_id"]})
+    # 4. Finally, delete the character row.
+    chars_table.delete_item(Key={"slug": slug})
+```
+
+### Why it looks this way
+
+- **`batch_writer()` (from the resource API) handles the 25-item batch limit and retries unprocessed items** so you don't have to. Just `.delete_item(Key=...)` inside the `with` block.
+- **Pagination via `LastEvaluatedKey`** — DDB caps a single page at 1 MB. Always loop until `LastEvaluatedKey` is absent.
+- **Order matters when readers might race the delete**: events → session row → character row, so a reader can never see "session exists, events gone" or "character gone, sessions still listed."
+
+### When to outgrow this
+
+- If cascade volume is huge (thousands of events per character), this becomes a Lambda timeout risk. Switch to async cleanup: write a "delete marker" record, return 202, let a separate Lambda triggered by a DDB Stream do the actual deletions.
+- If you need atomicity (all-or-nothing across rows), use `TransactWriteItems` — but you're capped at 100 items per transaction.
+
+---
+
+## Pattern: Decimal coercion for JSON responses
+
+The boto3 *resource* API (`boto3.resource("dynamodb")`) is much nicer to write than the *client* API for writes — but it returns DDB numbers as Python `Decimal` objects, which `json.dumps` can't serialize.
+
+```python
+from decimal import Decimal
+import json
+
+def _json_default(o):
+    if isinstance(o, Decimal):
+        return int(o) if o == o.to_integral_value() else float(o)
+    return str(o)
+
+body = json.dumps(payload, default=_json_default)
+```
+
+### Why this gotcha bites hard
+
+If you forget the encoder and call `json.dumps(item, default=str)` instead, every number becomes a *string* in the response. The API "works" (200 OK, valid JSON), but the frontend silently breaks: `event.payload.result + 5` becomes `"205"` instead of `25`. The bug surfaces far from the cause.
+
+Watch for it specifically in API responses going to a frontend that does arithmetic on event payloads.
+
+### Alternative: low-level client
+
+`boto3.client("dynamodb")` returns the raw DDB wire format (`{"N": "20"}`), which you then deserialize yourself with `TypeDeserializer().deserialize()`. That returns `Decimal` too, but at least the conversion is in *your* code so the encoder is obviously needed.
+
+The resource API is worth it for the cleaner write code; just always pair it with the encoder above.
+
+---
+
 ## When DynamoDB is NOT the right answer
 
 | Need | Better choice |

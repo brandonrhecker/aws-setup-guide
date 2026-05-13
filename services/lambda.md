@@ -235,6 +235,134 @@ Lambda's deploy is technically eventually consistent. Brief overlap (~seconds) b
 **Lambda can read public internet but not VPC-internal resources**
 Default: Lambda runs in AWS-managed VPC with internet egress. To reach private RDS/EC2/etc., put Lambda in your VPC — but then you lose internet unless you also add a NAT Gateway ($32/mo idle). Avoid VPC-attached Lambdas unless absolutely required.
 
+**Default timeout is 3 seconds**
+Lambda's default function timeout is 3s, which is too short for almost any real workload that talks to an upstream API. Symptom: function returns `Task timed out after 3.00 seconds` while the upstream API was happily about to respond. Bump to 10-30s for typical HTTP-backed work; the Lambda hard max is 15 min. `aws lambda update-function-configuration --function-name <fn> --timeout 30`.
+
+**boto3 DDB resource API returns `Decimal`, not `int`/`float`**
+If your function uses `boto3.resource("dynamodb")` (the high-level API) and JSON-encodes the result, numbers come out as `Decimal` objects which `json.dumps` can't serialize. The classic workaround is a custom `default=` function that coerces `Decimal` → `int` (when whole) or `float`. Frontends doing math on event payloads will silently break otherwise — strings concat instead of summing. See [DynamoDB guide](./dynamodb.md) for the encoder snippet.
+
+---
+
+## Pattern: Lambda Layers
+
+Layers are reusable ZIP packages of code/libraries that you attach to one or more Lambda functions. Up to 5 layers per function. Each layer's contents are extracted into `/opt/` at runtime, and the language runtime's import path is set up to find them.
+
+**When to use a Layer:**
+- A heavyweight dependency (`requests`, `numpy`, `Pillow`) used across multiple functions
+- A shared helper module ("common code" used by every function in your app)
+- Anything that bloats the function zip and slows code deploys
+
+**When not to bother:**
+- A one-off function — the dependency lives fine in the function zip
+- Tiny pure-stdlib code with no third-party deps
+
+### Building a Python Layer
+
+The Layer zip must use a specific directory structure: `python/` at the root (Lambda extracts to `/opt/python` and `PYTHONPATH` is set so imports just work).
+
+```bash
+LAYER_DIR=/tmp/my-deps-layer
+rm -rf $LAYER_DIR && mkdir -p $LAYER_DIR/python
+
+# Install your deps into python/ instead of the system site-packages.
+pip install --target $LAYER_DIR/python requests
+
+# zip from inside the layer dir; the zip root must be python/, not python/...
+cd $LAYER_DIR
+python3 -c "
+import zipfile, os
+with zipfile.ZipFile('layer.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+    for root, _, files in os.walk('python'):
+        for f in files:
+            full = os.path.join(root, f); z.write(full, full)
+"
+```
+
+If you have `zip` installed: `zip -r layer.zip python` works too.
+
+### Publishing + attaching
+
+```bash
+aws lambda publish-layer-version \
+  --layer-name my-deps \
+  --description "requests + transitive deps" \
+  --zip-file fileb:///tmp/my-deps-layer/layer.zip \
+  --compatible-runtimes python3.14 \
+  --compatible-architectures x86_64
+# → returns LayerVersionArn
+
+aws lambda update-function-configuration \
+  --function-name my-function \
+  --layers arn:aws:lambda:us-east-1:<account-id>:layer:my-deps:1
+```
+
+Each `publish-layer-version` creates a *new immutable version* (the `:1` suffix). You don't update a Layer in place — you publish v2, v3, etc., and update the function to point at the new ARN.
+
+### Gotchas
+
+- **Architecture mismatch:** if you `pip install` on a non-Linux/x86_64 machine, some libraries (anything with C extensions — `pydantic-core`, `numpy`, `Pillow`) will install the wrong wheel. Use Docker (`public.ecr.aws/sam/build-python3.14`) or AWS CloudShell to build cross-compat Layers.
+- **Total deploy size limit:** function code + all attached Layers must be ≤ 250 MB unzipped (50 MB zipped on direct upload, 250 MB via S3). Stripping `tests/`, `*.dist-info`, and `__pycache__` helps.
+- **Layer + function zip override:** if both contain the same module, the function zip wins. Useful for emergency hotfixes; confusing if unintentional.
+
+---
+
+## Pattern: Bundling app code as a package alongside `lambda_function.py`
+
+When your Lambda needs to import shared modules from elsewhere in your codebase (a `lib/` package with serializers, models, etc.), you can't just `pip install` them — they're not on PyPI. Bundle them straight into the function zip as a package.
+
+**Layout in the function zip:**
+
+```
+lambda_function.py          ← entrypoint
+lib/
+  __init__.py
+  models.py
+  serializers.py
+```
+
+**In `lambda_function.py`:**
+
+```python
+from lib.models import MyModel
+from lib.serializers import to_dict
+```
+
+**Build script (run before `update-function-code`):**
+
+```bash
+cd lambda_handlers
+rm -rf build && mkdir -p build/lib
+cp lambda_function.py build/
+cp ../shared/lib/__init__.py ../shared/lib/models.py ../shared/lib/serializers.py build/lib/
+cd build
+python3 -c "
+import zipfile, os
+with zipfile.ZipFile('../lambda_function.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+    for root, _, files in os.walk('.'):
+        for f in files:
+            full = os.path.join(root, f); z.write(full, os.path.relpath(full, '.'))
+"
+```
+
+Then `aws lambda update-function-code --zip-file fileb://lambda_function.zip` as usual.
+
+### Why not symlinks?
+
+Symlinks survive zip but Lambda's unzip resolves them at extract — sometimes pointing at paths that don't exist in the runtime. Just copy the files.
+
+### Why not a Layer for app code?
+
+You can — but Layers are immutable per version. App code changes a lot during development; you'd burn through Layer versions and have to update the function each time. Use Layers for stable deps, bundle app code in the function zip.
+
+### Mixing the two
+
+A realistic real-world setup:
+
+- **Layer:** `requests`, `boto3` extras, any third-party deps (rarely changes)
+- **Function zip:** `lambda_function.py` + bundled `lib/` package (changes often)
+
+Code deploys are fast (small zip), shared deps don't bloat every function.
+
 ---
 
 ## Pattern: One Fat Lambda + Internal Dispatch
